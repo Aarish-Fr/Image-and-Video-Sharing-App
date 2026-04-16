@@ -1,120 +1,109 @@
 from fastapi import FastAPI
-from fastapi import HTTPException
+from fastapi import HTTPException, File, UploadFile, Form, Depends
 from app.schemas import PostCreate, PostResponse
 from app.db import Post, create_db_and_tables, get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imagekit
+import shutil
+import os
+import uuid
+import tempfile
 
+# context manager makes the function have 3 phases: setup, pause, and shutdown
+# this whole function make sure that when server start we have our db and tables ready before some try access them and are safely close once execution finshes
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_db_and_tables()
-    yield
+    await create_db_and_tables()    # pauses the function until the create_db_and_tables function gets finshes.
+    yield   # any code written before yield will start immediately once server starts.
 
 #initializing the fastApi app
 app = FastAPI(lifespan=lifespan)
 
-text_posts = {
-    1: {
-        "title": "Understanding Python's __name__ Variable",
-        "content": "Today I learned how to prevent my FastAPI server from auto-starting when imported!",
-        "author": "BackendBeginner99",
-        "published": True,
-        "likes": 42
-    },
-    2: {
-        "title": "My first SQLAlchemy model",
-        "content": "Still working on the draft for this one, database tables are tricky...",
-        "author": "BackendBeginner99",
-        "published": False,
-        "likes": 0
-    },
-    3: {
-        "title": "Uploading Images in FastAPI",
-        "content": "Just figured out how to use UploadFile to handle image uploads. It is surprisingly clean.",
-        "author": "MediaAppDev",
-        "published": True,
-        "likes": 156
-    },
-    4: {
-        "title": "Stuck on Path Parameters",
-        "content": "Trying to build a route to get a specific post by ID. Keep getting a 404 error.",
-        "author": "CodeNewbie",
-        "published": True,
-        "likes": 3
-    },
-    5: {
-        "title": "Handling Video Files",
-        "content": "Videos are massive. I need to figure out how to stream them in chunks instead of loading the whole file into server memory.",
-        "author": "MediaAppDev",
-        "published": False,
-        "likes": 0
-    },
-    6: {
-        "title": "PostgreSQL vs SQLite for development",
-        "content": "Is it okay to use SQLite while building my app locally before switching to Postgres?",
-        "author": "BackendBeginner99",
-        "published": True,
-        "likes": 12
-    },
-    7: {
-        "title": "Pydantic models are a lifesaver",
-        "content": "Data validation used to be a nightmare in other languages. Pydantic makes making sure a user submits a valid email address so easy.",
-        "author": "PythonLover",
-        "published": True,
-        "likes": 56
-    },
-    8: {
-        "title": "Why is Uvicorn so fast?",
-        "content": "Reading about ASGI servers today. Uvicorn handles asynchronous requests beautifully.",
-        "author": "FastAPI_Fanatic",
-        "published": True,
-        "likes": 88
-    },
-    9: {
-        "title": "Handling CORS errors",
-        "content": "My frontend couldn't talk to my FastAPI backend until I added the CORSMiddleware. Security features are strict!",
-        "author": "FullStackWannabe",
-        "published": True,
-        "likes": 120
-    },
-    10: {
-        "title": "Deploying my first app",
-        "content": "Getting ready to push this code to a real server. Does anyone have tips for absolute beginners?",
-        "author": "CodeNewbie",
-        "published": True,
-        "likes": 25
-    }
-}
+# UPLOAD endpoint: handles all the file uploads into the databse
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file_path = None
 
-#Endpoint GET: Returns all the post
-@app.get("/posts")
-def get_all_posts(limit : int = None):      # query parameter
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
 
-# if the parameter is passed only in the function, than it automatically become a query PARAMETER
-    if limit:
-        return list(text_posts.values())[: limit]
+        with open(temp_file_path, "rb") as image_file:
+            upload_result = imagekit.files.upload(
+                file = image_file,
+                file_name = file.filename,
+                use_unique_file_name = True,
+                tags = ["backend-upload"]
+            )
+
+            post = Post(
+                caption = caption,
+                url = upload_result.url,
+                file_type = "video" if file.content_type.startswith("video/") else "image",
+                file_name = upload_result.name
+            )
+
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
+            return post
     
-    return text_posts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-#Endpoint GET: return post based on the ID entered
-@app.get("/posts/{id}")     # the id here is path parameter, a dynamic value
-def get_post(id : int) -> PostResponse:
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+            file.file.close()
 
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post Not Found")
-    return text_posts.get(id)   
+#GET Endpoint : returns the uploaded post to the user 
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+):
+    # resukt is a cursor object return by the sqlAlchemy which points to the rows in the db and is a set of tuples
+    result = await session.execute(select(Post).order_by(Post.created_at.desc())) 
+    posts = [row[0] for row in result.all()]  # our main object is at 0th index
 
-#Endpoint POST : creating a new text post
-@app.post("/posts") 
-def create_post(post : PostCreate) -> PostResponse:
-    new_post = {
-        "title" : post.title,
-        "content" : post.content,
-        "author" : post.author,
-        "published" : post.published,
-        "likes" : post.likes
-    }
+    posts_data = []
+    
+    for post in posts:
+        posts_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat()
+            }
+        )
+    
+    return {"posts": posts_data}
 
-    text_posts[max(text_posts.keys()) + 1] = new_post
 
-    return new_post
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: str, session : AsyncSession = Depends(get_async_session)):
+    try:
+        post_uuid = uuid.UUID(post_id)
+
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        post = result.scalars().first()
+
+        if not post:
+            raise HTTPException(status_code = 404, detail="Post not found")
+        
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
